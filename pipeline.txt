@@ -1,0 +1,147 @@
+pipeline {
+    agent any
+        parameters {
+        listGitBranches branchFilter: '.*', credentialsId: 'Jenkins-SA', defaultValue: '', name: 'Branch_Name', quickFilterEnabled: true, remoteURL: 'https://github.com/LifeStanceHealth/polaris', selectedValue: 'NONE', sortMode: 'NONE', tagFilter: '*', type: 'PT_BRANCH'
+        }
+        environment {
+        USER_CREDENTIALS = credentials('dw_ad')
+        branch_artifact_name = sh (script: 'echo ${Branch_Name} | rev | cut -d/ -f1 | rev' , returnStdout: true).trim()    
+        branch_Id = sh (script: 'echo ${Branch_Name} |cut -d/ -f3-9' , returnStdout: true).trim()
+        PROD_WEB = 
+'''perf-web-1.internallifestance.com
+perf-web-2.internallifestance.com'''
+        PROD_APP = 
+'''perf-app-1.internallifestance.com
+perf-app-2.internallifestance.com
+perf-skq-1.internallifestance.com'''  
+    WEB = '''WEB1
+WEB2'''
+    }
+
+    stages {
+          stage('Git Checkout') {
+          steps {
+                git branch: "$branch_Id", credentialsId: 'GITHUB-SA', url: 'git@github.com:LifeStanceHealth/polaris.git'
+            }
+        }
+         stage('Build') {
+            steps {
+                echo "Installing packages"
+                sh 'bundle install'
+            }
+        }
+
+        stage('Packaging Application') {
+            steps {
+                sh 'rm -f ror-*.zip'
+                sh 'zip -r ror-$branch_artifact_name-$BUILD_ID.zip * -x Jenkinsfile'
+                sh 'curl -u $USER_CREDENTIALS_USR:$USER_CREDENTIALS_PSW -T ror-$branch_artifact_name-$BUILD_ID.zip http://mgmt-artifactory-1.internallifestance.com:8081/artifactory/lfs-local-repo/lfs/ror/$branch_artifact_name-$BUILD_ID/'
+            }
+        }
+        stage('Select Env to Deploy'){
+            steps{
+              script {
+                  try {
+                    timeout(time: 5, unit: 'MINUTES') {
+                      script{
+                          def environment = input message: "Select an Environment to Deploy?", ok: "Select", parameters: [
+                          choice(name: 'environment', choices: ['Nothing','PROD-WEB', 'PROD-APP'], description: 'Please select the environment to deploy')
+                          ]
+                          env.environment = environment
+                          echo "Environment selected: $environment"
+                          }
+                       }
+                    }
+                    catch(Exception err){
+                        env.environment = "Nothing"
+                    }
+                }
+            }
+        }
+
+        stage ('ENV Selected') {
+          parallel {
+            stage('PROD-WEB') {
+              when {
+                equals expected: 'PROD-WEB', actual: environment
+              }
+              steps {
+                script {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                  echo 'Deploying to PROD PERF WEB Environment'
+                  sh '''
+                   environment=`echo ${PROD_WEB}`
+                    for env in $environment
+                    do
+                    ssh -vtt -o StrictHostKeyChecking=no $env "/lfs/scripts/deploy.sh $USER_CREDENTIALS_USR $USER_CREDENTIALS_PSW $branch_artifact_name $BUILD_ID"
+                    done
+                '''
+                  }
+                }
+              }
+            }
+            stage('WEB') {
+              when {
+                equals expected: 'PROD-APP', actual: environment
+              }
+              steps {
+                script {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                  echo 'Deploying to PROD PERF APP Environment'
+                 sh '''
+                    environment=`echo ${PROD_APP}`
+                    for env in $environment
+                    do
+                    ssh -tt -o StrictHostKeyChecking=no $env "/home/Amaresh.Merugu/test.sh $USER_CREDENTIALS_USR $USER_CREDENTIALS_PSW $branch_artifact_name $BUILD_ID"
+                    done
+                '''
+                  }
+                }
+              }
+            }             
+          }
+        }
+    }
+post{
+     success{
+        script{
+          if (env.environment == "PROD-WEB" || env.environment == "PROD-APP"){
+                slackSend (
+                color: 'good',
+                message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} Build-${env.BUILD_NUMBER} Deployment to $environment from Branch $branch_Id \n SUCCESS: More info at: ${env.BUILD_URL}" ) 
+                environmentDashboard(addColumns: false, buildJob: "$JOB_NAME", buildNumber: "$BUILD_ID", componentName: 'Rails', data: [], nameOfEnv: environment, packageName: "$branch_artifact_name-$BUILD_ID") {
+                   echo 'Deployment Successfull'
+                }
+           }
+           else{
+               echo "Environment Not Selected"
+           }
+        }
+    }
+    unstable{
+        script{
+           if (env.environment == "PROD-WEB" || env.environment == "PROD-APP"){
+                slackSend (
+                color: 'warning',
+                message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} Build-${env.BUILD_NUMBER} Deployment to $environment from Branch $branch_Id \n UNSTABLE: More info at: ${env.BUILD_URL}" )
+           }
+           else{
+               echo "Environment Not Selected"
+           }
+                }
+    }
+    failure{
+        script{
+           if (env.environment == "PROD-WEB" || env.environment == "PROD-APP"){
+                slackSend (
+                color: 'danger',
+                message: "*${currentBuild.currentResult}:* Job ${env.JOB_NAME} Build-${env.BUILD_NUMBER} Deployment to $environment from Branch $branch_Id \n FAILURE: More info at: ${env.BUILD_URL}" )
+           }
+           else{
+               echo "Environment Not Selected"
+           }
+
+                }
+        }
+    }    
+}
